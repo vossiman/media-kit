@@ -13,8 +13,11 @@
 #include "../common/video_dimensions.h"
 
 #include <epoxy/egl.h>
+#include <fcntl.h>
+#include <string.h>
 #include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
+#include <unistd.h>
 
 struct _VideoOutput {
   GObject parent_instance;
@@ -27,6 +30,7 @@ struct _VideoOutput {
   GMutex mutex; /* Only used in S/W rendering. */
   mpv_handle* handle;
   mpv_render_context* render_context;
+  int render_fd; /* DRM render node for mpv's VA-API, -1 if none. */
   gint64 width;
   gint64 height;
   VideoOutputConfiguration configuration;
@@ -83,7 +87,12 @@ static void video_output_dispose(GObject* object) {
       self->render_context = NULL;
     }
   }
-  
+  // After mpv_render_context_free: mpv's VA display uses this fd.
+  if (self->render_fd >= 0) {
+    close(self->render_fd);
+    self->render_fd = -1;
+  }
+
   g_mutex_clear(&self->mutex);
   G_OBJECT_CLASS(video_output_parent_class)->dispose(object);
 }
@@ -101,6 +110,7 @@ static void video_output_init(VideoOutput* self) {
   self->pixel_buffer = NULL;
   self->handle = NULL;
   self->render_context = NULL;
+  self->render_fd = -1;
   self->width = 0;
   self->height = 0;
   self->configuration = VideoOutputConfiguration{};
@@ -110,6 +120,37 @@ static void video_output_init(VideoOutput* self) {
   self->gl_render_thread = NULL;
   self->destroyed = FALSE;
   g_mutex_init(&self->mutex);
+}
+
+// mpv tries VA-API over DRM only after X11 and Wayland, so this is a fallback
+// for libmpv builds without vaapi-x11 (any -Dgpl=false build). Without it
+// they decode with vaapi-copy. Prefers the node of the GPU behind the EGL
+// display; Mesa may expose no EGL device, hence the first-node fallback.
+static int open_render_node(EGLDisplay egl_display) {
+  if (epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_device_query")) {
+    EGLAttrib device = 0;
+    if (eglQueryDisplayAttribEXT(egl_display, EGL_DEVICE_EXT, &device) && device) {
+      const char* extensions =
+          eglQueryDeviceStringEXT((EGLDeviceEXT)device, EGL_EXTENSIONS);
+      if (extensions && strstr(extensions, "EGL_EXT_device_drm_render_node")) {
+        const char* node = eglQueryDeviceStringEXT((EGLDeviceEXT)device,
+                                                   EGL_DRM_RENDER_NODE_FILE_EXT);
+        int fd = node ? open(node, O_RDWR | O_CLOEXEC) : -1;
+        if (fd >= 0) {
+          return fd;
+        }
+      }
+    }
+  }
+  for (int minor = 128; minor < 192; minor++) {
+    gchar* node = g_strdup_printf("/dev/dri/renderD%d", minor);
+    int fd = open(node, O_RDWR | O_CLOEXEC);
+    g_free(node);
+    if (fd >= 0) {
+      return fd;
+    }
+  }
+  return -1;
 }
 
 VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
@@ -229,6 +270,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
               {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
               {MPV_RENDER_PARAM_INVALID, (void*)0},
               {MPV_RENDER_PARAM_INVALID, (void*)0},
+              {MPV_RENDER_PARAM_INVALID, (void*)0},
           };
 
           // VAAPI acceleration requires passing X11/Wayland display.
@@ -239,6 +281,14 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
           } else if (GDK_IS_X11_DISPLAY(display)) {
             params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
             params[2].data = gdk_x11_display_get_xdisplay(display);
+          }
+
+          self->render_fd = open_render_node(self->egl_display);
+          mpv_opengl_drm_params_v2 drm_params{-1, -1, -1, NULL, self->render_fd};
+          if (self->render_fd >= 0) {
+            int slot = params[2].type == MPV_RENDER_PARAM_INVALID ? 2 : 3;
+            params[slot].type = MPV_RENDER_PARAM_DRM_DISPLAY_V2;
+            params[slot].data = &drm_params;
           }
 
           if (mpv_render_context_create(&self->render_context, self->handle, params) == 0) {
@@ -257,6 +307,10 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
             g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context in dedicated thread.\n");
           } else {
             g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
+            if (self->render_fd >= 0) {
+              close(self->render_fd);
+              self->render_fd = -1;
+            }
             eglDestroyContext(self->egl_display, self->egl_context);
             self->egl_context = EGL_NO_CONTEXT;
           }
