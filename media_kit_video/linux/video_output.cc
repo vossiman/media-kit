@@ -19,6 +19,11 @@
 #include <gdk/gdkx.h>
 #include <unistd.h>
 
+// libepoxy 1.5.10 (Ubuntu 24.04) lacks EGL_EXT_device_drm_render_node.
+#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
+#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
+#endif
+
 struct _VideoOutput {
   GObject parent_instance;
   TextureGL* texture_gl;
