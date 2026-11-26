@@ -127,10 +127,11 @@ static void video_output_init(VideoOutput* self) {
   g_mutex_init(&self->mutex);
 }
 
-// mpv tries VA-API over DRM only after X11 and Wayland, so this is a fallback
-// for libmpv builds without vaapi-x11 (any -Dgpl=false build). Without it
-// they decode with vaapi-copy. Prefers the node of the GPU behind the EGL
-// display; Mesa may expose no EGL device, hence the first-node fallback.
+// mpv tries VA-API over DRM only after X11 and Wayland, so this only matters
+// where neither works, such as an X11 session with a libmpv built without
+// vaapi-x11 (any -Dgpl=false build), which otherwise cannot use direct vaapi.
+// The node must belong to the GPU behind the EGL display. Mesa may expose no
+// EGL device, so a node is guessed only when the machine has exactly one.
 static int open_render_node(EGLDisplay egl_display) {
   if (epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_device_query")) {
     EGLAttrib device = 0;
@@ -147,15 +148,22 @@ static int open_render_node(EGLDisplay egl_display) {
       }
     }
   }
+  int found = -1;
   for (int minor = 128; minor < 192; minor++) {
     gchar* node = g_strdup_printf("/dev/dri/renderD%d", minor);
     int fd = open(node, O_RDWR | O_CLOEXEC);
     g_free(node);
-    if (fd >= 0) {
-      return fd;
+    if (fd < 0) {
+      continue;
     }
+    if (found >= 0) {
+      close(found);
+      close(fd);
+      return -1;
+    }
+    found = fd;
   }
-  return -1;
+  return found;
 }
 
 VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
